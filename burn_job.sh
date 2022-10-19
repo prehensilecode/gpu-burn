@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
-#SBATCH --nodelist=gpu002
+# #SBATCH --nodelist=gpu002
 #SBATCH --gpus=4
 #SBATCH --mem-per-gpu=40G
 #SBATCH --time=0:10:00
