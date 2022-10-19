@@ -585,7 +585,11 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             float elapsed =
                 fminf((float)(thisTime - startTime) / (float)runTime * 100.0f,
                       100.0f);
-            printf("\r%.1f%%  ", elapsed);
+            if (isatty(STDOUT_FILENO)) {
+                printf("\r%.1f%%  ", elapsed);
+            } else {
+                printf("\n%.1f%%  ", elapsed);
+            }
             printf("proc'd: ");
             for (size_t i = 0; i < clientCalcs.size(); ++i) {
                 printf("%d (%.0f Gflop/s) ", clientCalcs.at(i),
