@@ -27,146 +27,70 @@
  *policies, either expressed or implied, of the FreeBSD Project.
  */
 
-#define SIZE                                                                   \
-    2048ul // Matrices are SIZE*SIZE..  2048^2 should be efficiently implemented \
-        // in CUBLAS
+// Matrices are SIZE*SIZE..  POT should be efficiently implemented in CUBLAS
+#define SIZE 8192ul
 #define USEMEM 0.9 // Try to allocate 90% of memory
+#define COMPARE_KERNEL "compare.ptx"
 
 // Used to report op/s, measured through Visual Profiler, CUBLAS from CUDA 7.5
 // (Seems that they indeed take the naive dim^3 approach)
-#define OPS_PER_MUL 17188257792ul
+//#define OPS_PER_MUL 17188257792ul // Measured for SIZE = 2048
+#define OPS_PER_MUL 1100048498688ul // Extrapolated for SIZE = 8192
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <errno.h>
+#include <exception>
 #include <fstream>
 #include <map>
 #include <signal.h>
+#include <stdexcept>
 #include <string.h>
 #include <string>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <time.h>
 #include <unistd.h>
 #include <vector>
+
+#define SIGTERM_TIMEOUT_THRESHOLD_SECS 30 // number of seconds for sigterm to kill child processes before forcing a sigkill
 
 #include "cublas_v2.h"
 #define CUDA_ENABLE_DEPRECATED
 #include <cuda.h>
 
-void checkError(int rCode, std::string desc = "") {
-    static std::map<int, std::string> g_errorStrings;
-    if (!g_errorStrings.size()) {
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_INVALID_VALUE, "CUDA_ERROR_INVALID_VALUE"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_OUT_OF_MEMORY, "CUDA_ERROR_OUT_OF_MEMORY"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_NOT_INITIALIZED, "CUDA_ERROR_NOT_INITIALIZED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_DEINITIALIZED, "CUDA_ERROR_DEINITIALIZED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_NO_DEVICE, "CUDA_ERROR_NO_DEVICE"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_INVALID_DEVICE, "CUDA_ERROR_INVALID_DEVICE"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_INVALID_IMAGE, "CUDA_ERROR_INVALID_IMAGE"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_INVALID_CONTEXT, "CUDA_ERROR_INVALID_CONTEXT"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_MAP_FAILED, "CUDA_ERROR_MAP_FAILED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_UNMAP_FAILED, "CUDA_ERROR_UNMAP_FAILED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_ARRAY_IS_MAPPED, "CUDA_ERROR_ARRAY_IS_MAPPED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_ALREADY_MAPPED, "CUDA_ERROR_ALREADY_MAPPED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_NO_BINARY_FOR_GPU, "CUDA_ERROR_NO_BINARY_FOR_GPU"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_ALREADY_ACQUIRED, "CUDA_ERROR_ALREADY_ACQUIRED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_NOT_MAPPED, "CUDA_ERROR_NOT_MAPPED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_NOT_MAPPED_AS_ARRAY, "CUDA_ERROR_NOT_MAPPED_AS_ARRAY"));
-        g_errorStrings.insert(
-            std::pair<int, std::string>(CUDA_ERROR_NOT_MAPPED_AS_POINTER,
-                                        "CUDA_ERROR_NOT_MAPPED_AS_POINTER"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_UNSUPPORTED_LIMIT, "CUDA_ERROR_UNSUPPORTED_LIMIT"));
-        g_errorStrings.insert(
-            std::pair<int, std::string>(CUDA_ERROR_CONTEXT_ALREADY_IN_USE,
-                                        "CUDA_ERROR_CONTEXT_ALREADY_IN_USE"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_INVALID_SOURCE, "CUDA_ERROR_INVALID_SOURCE"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_FILE_NOT_FOUND, "CUDA_ERROR_FILE_NOT_FOUND"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND,
-            "CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_SHARED_OBJECT_INIT_FAILED,
-            "CUDA_ERROR_SHARED_OBJECT_INIT_FAILED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_OPERATING_SYSTEM, "CUDA_ERROR_OPERATING_SYSTEM"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_INVALID_HANDLE, "CUDA_ERROR_INVALID_HANDLE"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_NOT_FOUND, "CUDA_ERROR_NOT_FOUND"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_NOT_READY, "CUDA_ERROR_NOT_READY"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_LAUNCH_FAILED, "CUDA_ERROR_LAUNCH_FAILED"));
-        g_errorStrings.insert(
-            std::pair<int, std::string>(CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES,
-                                        "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_LAUNCH_TIMEOUT, "CUDA_ERROR_LAUNCH_TIMEOUT"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_LAUNCH_INCOMPATIBLE_TEXTURING,
-            "CUDA_ERROR_LAUNCH_INCOMPATIBLE_TEXTURING"));
-        g_errorStrings.insert(
-            std::pair<int, std::string>(CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE,
-                                        "CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE"));
-        g_errorStrings.insert(
-            std::pair<int, std::string>(CUDA_ERROR_CONTEXT_IS_DESTROYED,
-                                        "CUDA_ERROR_CONTEXT_IS_DESTROYED"));
-        g_errorStrings.insert(std::pair<int, std::string>(
-            CUDA_ERROR_UNKNOWN, "CUDA_ERROR_UNKNOWN"));
-    }
+void _checkError(int rCode, std::string file, int line, std::string desc = "") {
+    if (rCode != CUDA_SUCCESS) {
+        const char *err;
+        cuGetErrorString((CUresult)rCode, &err);
 
-    if (rCode != CUDA_SUCCESS)
-        throw((desc == "")
-                  ? std::string("Error: ")
-                  : (std::string("Error in \"") + desc + std::string("\": "))) +
-            g_errorStrings[rCode];
+        throw std::runtime_error(
+            (desc == "" ? std::string("Error (")
+                        : (std::string("Error in ") + desc + " (")) +
+            file + ":" + std::to_string(line) + "): " + err);
+        // Yes, this *is* a memory leak, but this block is only executed on
+        // error, so it's not a big deal
+    }
 }
 
-void checkError(cublasStatus_t rCode, std::string desc = "") {
-    static std::map<cublasStatus_t, std::string> g_errorStrings;
-    if (!g_errorStrings.size()) {
-        g_errorStrings.insert(std::pair<cublasStatus_t, std::string>(
-            CUBLAS_STATUS_NOT_INITIALIZED, "CUBLAS_STATUS_NOT_INITIALIZED"));
-        g_errorStrings.insert(std::pair<cublasStatus_t, std::string>(
-            CUBLAS_STATUS_ALLOC_FAILED, "CUBLAS_STATUS_ALLOC_FAILED"));
-        g_errorStrings.insert(std::pair<cublasStatus_t, std::string>(
-            CUBLAS_STATUS_INVALID_VALUE, "CUBLAS_STATUS_INVALID_VALUE"));
-        g_errorStrings.insert(std::pair<cublasStatus_t, std::string>(
-            CUBLAS_STATUS_ARCH_MISMATCH, "CUBLAS_STATUS_ARCH_MISMATCH"));
-        g_errorStrings.insert(std::pair<cublasStatus_t, std::string>(
-            CUBLAS_STATUS_MAPPING_ERROR, "CUBLAS_STATUS_MAPPING_ERROR"));
-        g_errorStrings.insert(std::pair<cublasStatus_t, std::string>(
-            CUBLAS_STATUS_EXECUTION_FAILED, "CUBLAS_STATUS_EXECUTION_FAILED"));
-        g_errorStrings.insert(std::pair<cublasStatus_t, std::string>(
-            CUBLAS_STATUS_INTERNAL_ERROR, "CUBLAS_STATUS_INTERNAL_ERROR"));
+void _checkError(cublasStatus_t rCode, std::string file, int line, std::string desc = "") {
+    if (rCode != CUBLAS_STATUS_SUCCESS) {
+        const char *err = cublasGetStatusString(rCode);
+        throw std::runtime_error(
+            (desc == "" ? std::string("Error (")
+                        : (std::string("Error in ") + desc + " (")) +
+            file + ":" + std::to_string(line) + "): " + err);
+        // Yes, this *is* a memory leak, but this block is only executed on
+        // error, so it's not a big deal
     }
-
-    if (rCode != CUBLAS_STATUS_SUCCESS)
-        throw((desc == "")
-                  ? std::string("Error: ")
-                  : (std::string("Error in \"") + desc + std::string("\": "))) +
-            g_errorStrings[rCode];
 }
+
+#define checkError(rCode, ...)                                                 \
+    _checkError(rCode, __FILE__, __LINE__, ##__VA_ARGS__)
 
 double getTime() {
     struct timeval t;
@@ -178,8 +102,8 @@ bool g_running = false;
 
 template <class T> class GPU_Test {
   public:
-    GPU_Test(int dev, bool doubles, bool tensors)
-        : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors) {
+    GPU_Test(int dev, bool doubles, bool tensors, const char *kernelFile)
+        : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors), d_kernelFile(kernelFile){
         checkError(cuDeviceGet(&d_dev, d_devNumber));
         checkError(cuCtxCreate(&d_ctx, 0, d_dev));
 
@@ -271,7 +195,7 @@ template <class T> class GPU_Test {
 
         // Populating matrices A and B
         checkError(cuMemcpyHtoD(d_Adata, A, d_resultSize), "A -> device");
-        checkError(cuMemcpyHtoD(d_Bdata, B, d_resultSize), "A -> device");
+        checkError(cuMemcpyHtoD(d_Bdata, B, d_resultSize), "B -> device");
 
         initCompareKernel();
     }
@@ -302,14 +226,12 @@ template <class T> class GPU_Test {
     }
 
     void initCompareKernel() {
-        const char *kernelFile = "compare.ptx";
         {
-            std::ifstream f(kernelFile);
+            std::ifstream f(d_kernelFile);
             checkError(f.good() ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND,
-                       std::string("couldn't find file \"") + kernelFile +
-                           "\" from working directory");
+                       std::string("couldn't find compare kernel: ") + d_kernelFile);
         }
-        checkError(cuModuleLoad(&d_module, kernelFile), "load module");
+        checkError(cuModuleLoad(&d_module, d_kernelFile), "load module");
         checkError(cuModuleGetFunction(&d_function, d_module,
                                        d_doubles ? "compareD" : "compare"),
                    "get func");
@@ -349,6 +271,7 @@ template <class T> class GPU_Test {
     bool d_doubles;
     bool d_tensors;
     int d_devNumber;
+    const char *d_kernelFile;
     size_t d_iters;
     size_t d_resultSize;
 
@@ -389,14 +312,14 @@ int initCuda() {
 
 template <class T>
 void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors,
-               ssize_t useBytes) {
+               ssize_t useBytes, const char *kernelFile) {
     GPU_Test<T> *our;
     try {
-        our = new GPU_Test<T>(index, doubles, tensors);
+        our = new GPU_Test<T>(index, doubles, tensors, kernelFile);
         our->initBuffers(A, B, useBytes);
-    } catch (std::string e) {
-        fprintf(stderr, "Couldn't init a GPU test: %s\n", e.c_str());
-        exit(124);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Couldn't init a GPU test: %s\n", e.what());
+        exit(EMEDIUMTYPE);
     }
 
     // The actual work
@@ -431,13 +354,13 @@ void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors,
         for (int i = 0; i < maxEvents; ++i)
             cuEventSynchronize(events[i]);
         delete our;
-    } catch (std::string e) {
-        fprintf(stderr, "Failure during compute: %s\n", e.c_str());
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Failure during compute: %s\n", e.what());
         int ops = -1;
         // Signalling that we failed
         write(writeFd, &ops, sizeof(int));
         write(writeFd, &ops, sizeof(int));
-        exit(111);
+        exit(ECONNREFUSED);
     }
 }
 
@@ -454,7 +377,7 @@ int pollTemp(pid_t *p) {
                NULL);
         fprintf(stderr, "Could not invoke nvidia-smi, no temps available\n");
 
-        exit(0);
+        exit(ENODEV);
     }
 
     *p = myPid;
@@ -490,7 +413,7 @@ void updateTemps(int handle, std::vector<int> *temps) {
 }
 
 void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
-                   int runTime) {
+                   int runTime, std::chrono::seconds sigterm_timeout_threshold_secs) {
     fd_set waitHandles;
 
     pid_t tempPid;
@@ -619,6 +542,10 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 
             fflush(stdout);
 
+            for (size_t i = 0; i < clientErrors.size(); ++i)
+                if (clientErrors.at(i))
+                    clientFaulty.at(i) = true;
+
             if (nextReport < elapsed) {
                 nextReport = elapsed + 10.0f;
                 printf("\n\tSummary at:   ");
@@ -626,11 +553,8 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 system("date"); // Printing a date
                 fflush(stdout);
                 printf("\n");
-                for (size_t i = 0; i < clientErrors.size(); ++i) {
-                    if (clientErrors.at(i))
-                        clientFaulty.at(i) = true;
+                for (size_t i = 0; i < clientErrors.size(); ++i)
                     clientErrors.at(i) = 0;
-                }
             }
         }
 
@@ -641,19 +565,57 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 oneAlive = true;
         if (!oneAlive) {
             fprintf(stderr, "\n\nNo clients are alive!  Aborting\n");
-            exit(123);
+            exit(ENOMEDIUM);
         }
 
         if (startTime + runTime < thisTime)
             break;
     }
 
-    printf("\nKilling processes.. ");
+    printf("\nKilling processes with SIGTERM (soft kill)\n");
     fflush(stdout);
     for (size_t i = 0; i < clientPid.size(); ++i)
-        kill(clientPid.at(i), 15);
+        kill(clientPid.at(i), SIGTERM);
 
-    kill(tempPid, 15);
+    kill(tempPid, SIGTERM);
+
+    // processes should be terminated by SIGTERM within threshold time (so wait and then check pids)
+    std::this_thread::sleep_for(sigterm_timeout_threshold_secs);
+
+    // check each process and see if they are alive
+    std::vector<int> killed_processes; // track the number of killed processes
+    // loop through pids for each client / GPU
+    for (size_t i = 0; i < clientPid.size(); ++i) {
+        int status;
+        pid_t return_pid = waitpid(clientPid.at(i), &status, WNOHANG);
+        if (return_pid == clientPid.at(i)) {
+            /* child is finished. exit status in status */
+            killed_processes.push_back(return_pid);
+        }
+    }
+    // handle the tempPid
+    int status;
+    pid_t return_pid = waitpid(tempPid, &status, WNOHANG);
+    if (return_pid == tempPid) {
+        /* child is finished. exit status in status */
+        killed_processes.push_back(return_pid);
+    }
+
+    // number of killed process should be number GPUs + 1 (need to add tempPid process) to exit while loop early
+    if (killed_processes.size() != clientPid.size() + 1) {
+        printf("\nKilling processes with SIGKILL (force kill)\n");
+
+        for (size_t i = 0; i < clientPid.size(); ++i) {
+            // check if pid was already killed with SIGTERM before using SIGKILL
+            if (std::find(killed_processes.begin(), killed_processes.end(), clientPid.at(i)) == killed_processes.end())
+                kill(clientPid.at(i), SIGKILL);
+        }
+
+        // check if pid was already killed with SIGTERM before using SIGKILL
+        if (std::find(killed_processes.begin(), killed_processes.end(), tempPid) == killed_processes.end())
+            kill(tempPid, SIGKILL);
+    }
+
     close(tempHandle);
 
     while (wait(NULL) != -1)
@@ -667,7 +629,8 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 
 template <class T>
 void launch(int runLength, bool useDoubles, bool useTensorCores,
-            ssize_t useBytes, int device_id) {
+            ssize_t useBytes, int device_id, const char * kernelFile,
+            std::chrono::seconds sigterm_timeout_threshold_secs) {
     system("nvidia-smi -L");
 
     // Initting A and B with random data
@@ -698,7 +661,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             int devCount = 1;
             write(writeFd, &devCount, sizeof(int));
             startBurn<T>(device_id, writeFd, A, B, useDoubles, useTensorCores,
-                         useBytes);
+                         useBytes, kernelFile);
             close(writeFd);
             return;
         } else {
@@ -706,7 +669,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             close(mainPipe[1]);
             int devCount;
             read(readMain, &devCount, sizeof(int));
-            listenClients(clientPipes, clientPids, runLength);
+            listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
         }
         for (size_t i = 0; i < clientPipes.size(); ++i)
             close(clientPipes.at(i));
@@ -720,7 +683,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             write(writeFd, &devCount, sizeof(int));
 
             startBurn<T>(0, writeFd, A, B, useDoubles, useTensorCores,
-                         useBytes);
+                         useBytes, kernelFile);
 
             close(writeFd);
             return;
@@ -733,7 +696,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
 
             if (!devCount) {
                 fprintf(stderr, "No CUDA devices\n");
-                exit(EXIT_FAILURE);
+                exit(ENODEV);
             } else {
                 for (int i = 1; i < devCount; ++i) {
                     int slavePipe[2];
@@ -747,7 +710,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                         close(slavePipe[0]);
                         initCuda();
                         startBurn<T>(i, slavePipe[1], A, B, useDoubles,
-                                     useTensorCores, useBytes);
+                                     useTensorCores, useBytes, kernelFile);
 
                         close(slavePipe[1]);
                         return;
@@ -757,7 +720,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                     }
                 }
 
-                listenClients(clientPipes, clientPids, runLength);
+                listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
             }
         }
         for (size_t i = 0; i < clientPipes.size(); ++i)
@@ -778,6 +741,10 @@ void showHelp() {
     printf("-tc\tTry to use Tensor cores\n");
     printf("-l\tLists all GPUs in the system\n");
     printf("-i N\tExecute only on GPU N\n");
+    printf("-c FILE\tUse FILE as compare kernel.  Default is %s\n",
+           COMPARE_KERNEL);
+    printf("-stts T\tSet timeout threshold to T seconds for using SIGTERM to abort child processes before using SIGKILL.  Default is %d\n",
+           SIGTERM_TIMEOUT_THRESHOLD_SECS);
     printf("-h\tShow this help message\n\n");
     printf("Examples:\n");
     printf("  gpu-burn -d 3600 # burns all GPUs with doubles for an hour\n");
@@ -807,6 +774,8 @@ int main(int argc, char **argv) {
     int thisParam = 0;
     ssize_t useBytes = 0; // 0 == use USEMEM% of free mem
     int device_id = -1;
+    char *kernelFile = (char *)COMPARE_KERNEL;
+    std::chrono::seconds sigterm_timeout_threshold_secs = std::chrono::seconds(SIGTERM_TIMEOUT_THRESHOLD_SECS);
 
     std::vector<std::string> args(argv, argv + argc);
     for (size_t i = 1; i < args.size(); ++i) {
@@ -854,20 +823,41 @@ int main(int argc, char **argv) {
                 useBytes = decodeUSEMEM(argv[i]);
             } else {
                 fprintf(stderr, "Syntax error near -m\n");
-                exit(1);
+                exit(EINVAL);
             }
             if (useBytes == 0) {
                 fprintf(stderr, "Syntax error near -m\n");
-                exit(1);
+                exit(EINVAL);
             }
         }
         if (argc >= 2 && strncmp(argv[i], "-i", 2) == 0) {
             thisParam++;
 
-            device_id = strtol(argv[i] + 2, NULL, 0);
-            if (device_id <= 0 && argv[i][2] != '0') {
+            if (argv[i][2]) {
+                device_id = strtol(argv[i] + 2, NULL, 0);
+            } else if (i + 1 < args.size()) {
+                i++;
+                thisParam++;
+                device_id = strtol(argv[i], NULL, 0);
+            } else {
                 fprintf(stderr, "Syntax error near -i\n");
-                exit(1);
+                exit(EINVAL);
+            }
+        }
+        if (argc >= 2 && strncmp(argv[i], "-c", 2) == 0) {
+            thisParam++;
+
+            if (argv[i + 1]) {
+                kernelFile = argv[i + 1];
+                thisParam++;
+            }
+        }
+        if (argc >= 2 && strncmp(argv[i], "-stts", 2) == 0) {
+            thisParam++;
+
+            if (argv[i + 1]) {
+                sigterm_timeout_threshold_secs = std::chrono::seconds(atoi(argv[i + 1]));
+                thisParam++;
             }
         }
     }
@@ -876,14 +866,15 @@ int main(int argc, char **argv) {
         printf("Run length not specified in the command line. ");
     else
         runLength = atoi(argv[1 + thisParam]);
+    printf("Using compare file: %s\n", kernelFile);
     printf("Burning for %d seconds.\n", runLength);
 
     if (useDoubles)
         launch<double>(runLength, useDoubles, useTensorCores, useBytes,
-                       device_id);
+                       device_id, kernelFile, sigterm_timeout_threshold_secs);
     else
         launch<float>(runLength, useDoubles, useTensorCores, useBytes,
-                      device_id);
+                      device_id, kernelFile, sigterm_timeout_threshold_secs);
 
     return 0;
 }
